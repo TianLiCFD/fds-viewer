@@ -1,3 +1,263 @@
+/* Generic cut-plane support.
+ *
+ * This block intentionally lives in js/app.js so it can be applied as a
+ * zero-context patch even when viewer.js/index.html differ between branches.
+ * It extends FDSViewer at runtime and injects a small Cut Plane panel.
+ */
+(function installGenericCutPlaneSupport() {
+  if (typeof THREE === 'undefined' || typeof FDSViewer === 'undefined') {
+    console.warn('Cut plane support was not installed: THREE or FDSViewer is missing.');
+    return;
+  }
+
+  if (FDSViewer.prototype.__genericCutPlaneInstalled) return;
+  FDSViewer.prototype.__genericCutPlaneInstalled = true;
+
+  const originalLoadData = FDSViewer.prototype.loadData;
+
+  function getCutPlaneGroup(viewer) {
+    if (!viewer.cutPlaneGroup) {
+      viewer.cutPlaneGroup = new THREE.Group();
+      viewer.cutPlaneGroup.name = 'cutPlane';
+      if (viewer.scene) viewer.scene.add(viewer.cutPlaneGroup);
+    } else if (viewer.scene && !viewer.cutPlaneGroup.parent) {
+      viewer.scene.add(viewer.cutPlaneGroup);
+    }
+    return viewer.cutPlaneGroup;
+  }
+
+  FDSViewer.prototype.loadData = function patchedLoadData(...args) {
+    const result = originalLoadData.apply(this, args);
+    if (this.clipEnabled && this.clipPlane) {
+      this._applyCutPlaneToScene();
+      if (this.cutPlaneAxis && Number.isFinite(this.cutPlaneValue)) {
+        this._renderCutPlaneHelper(this.cutPlaneAxis, this.cutPlaneValue);
+      }
+    }
+    return result;
+  };
+
+  /**
+   * Apply a generic cut plane to the model.
+   *
+   * @param {'x'|'y'|'z'} axis - FDS axis, not Three.js axis.
+   * @param {number} value - Position along the selected FDS axis.
+   * @param {'negative'|'positive'} keepSide - Which side remains visible.
+   * @param {{showHelper?: boolean}} options - Optional display settings.
+   */
+  FDSViewer.prototype.setCutPlane = function setCutPlane(axis, value, keepSide = 'negative', options = {}) {
+    const axisLower = String(axis || '').toLowerCase();
+    const planeValue = Number(value);
+    const keepNegative = keepSide !== 'positive';
+
+    if (!['x', 'y', 'z'].includes(axisLower)) {
+      console.warn(`Invalid cut plane axis: ${axis}. Use x, y, or z.`);
+      return;
+    }
+
+    if (!Number.isFinite(planeValue)) {
+      console.warn(`Invalid cut plane value: ${value}`);
+      return;
+    }
+
+    if (this.renderer) this.renderer.localClippingEnabled = true;
+
+    let normal;
+    let constant;
+
+    if (axisLower === 'x') {
+      // FDS X -> Three.js X.
+      normal = keepNegative ? new THREE.Vector3(-1, 0, 0) : new THREE.Vector3(1, 0, 0);
+      constant = keepNegative ? planeValue : -planeValue;
+    } else if (axisLower === 'y') {
+      // FDS Y -> Three.js Z.
+      normal = keepNegative ? new THREE.Vector3(0, 0, -1) : new THREE.Vector3(0, 0, 1);
+      constant = keepNegative ? planeValue : -planeValue;
+    } else {
+      // FDS Z -> Three.js Y.
+      normal = keepNegative ? new THREE.Vector3(0, -1, 0) : new THREE.Vector3(0, 1, 0);
+      constant = keepNegative ? planeValue : -planeValue;
+    }
+
+    this.clipPlane = new THREE.Plane(normal, constant);
+    this.clipEnabled = true;
+    this.cutPlaneAxis = axisLower;
+    this.cutPlaneValue = planeValue;
+    this.cutPlaneKeepSide = keepNegative ? 'negative' : 'positive';
+
+    this._applyCutPlaneToScene();
+
+    if (options.showHelper !== false) {
+      this._renderCutPlaneHelper(axisLower, planeValue);
+    }
+  };
+
+  FDSViewer.prototype.clearCutPlane = function clearCutPlane() {
+    this.clipEnabled = false;
+    this.clipPlane = null;
+    this.cutPlaneAxis = null;
+    this.cutPlaneValue = null;
+    this.cutPlaneKeepSide = null;
+    this._applyCutPlaneToScene();
+    const group = getCutPlaneGroup(this);
+    while (group.children.length) {
+      const child = group.children.pop();
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+    }
+  };
+
+  FDSViewer.prototype.flipCutPlane = function flipCutPlane() {
+    if (!this.clipPlane) return;
+    this.clipPlane.negate();
+    this.cutPlaneKeepSide = this.cutPlaneKeepSide === 'positive' ? 'negative' : 'positive';
+    this._applyCutPlaneToScene();
+  };
+
+  FDSViewer.prototype._applyCutPlaneToScene = function _applyCutPlaneToScene() {
+    if (!this.scene) return;
+
+    const clippingPlanes = this.clipEnabled && this.clipPlane ? [this.clipPlane] : [];
+
+    const applyToMaterial = (material) => {
+      if (!material) return;
+      material.clippingPlanes = clippingPlanes;
+      material.clipShadows = true;
+      material.needsUpdate = true;
+    };
+
+    this.scene.traverse((object) => {
+      if (!object.isMesh || !object.material || object.userData.__cutPlaneHelper) return;
+
+      if (Array.isArray(object.material)) {
+        object.material.forEach(applyToMaterial);
+      } else {
+        applyToMaterial(object.material);
+      }
+    });
+  };
+
+  FDSViewer.prototype._renderCutPlaneHelper = function _renderCutPlaneHelper(axis, value) {
+    if (!this.scene) return;
+
+    const group = getCutPlaneGroup(this);
+    while (group.children.length) {
+      const child = group.children.pop();
+      if (child.geometry) child.geometry.dispose();
+      if (child.material) child.material.dispose();
+    }
+
+    const box = new THREE.Box3().setFromObject(this.scene);
+    if (box.isEmpty()) return;
+
+    const size = box.getSize(new THREE.Vector3());
+    const center = box.getCenter(new THREE.Vector3());
+
+    const width = Math.max(size.x, 0.1);
+    const height = Math.max(size.y, 0.1);
+    const depth = Math.max(size.z, 0.1);
+    const material = new THREE.MeshBasicMaterial({
+      color: 0x00d5ff,
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+      clippingPlanes: [],
+    });
+
+    let geometry;
+    let plane;
+
+    if (axis === 'z') {
+      // FDS Z plane -> Three.js horizontal X/Z plane at Y=value.
+      geometry = new THREE.PlaneGeometry(width, depth);
+      plane = new THREE.Mesh(geometry, material);
+      plane.position.set(center.x, value, center.z);
+      plane.rotation.x = -Math.PI / 2;
+    } else if (axis === 'y') {
+      // FDS Y plane -> Three.js X/Y plane at Z=value.
+      geometry = new THREE.PlaneGeometry(width, height);
+      plane = new THREE.Mesh(geometry, material);
+      plane.position.set(center.x, center.y, value);
+    } else {
+      // FDS X plane -> Three.js Y/Z plane at X=value.
+      geometry = new THREE.PlaneGeometry(depth, height);
+      plane = new THREE.Mesh(geometry, material);
+      plane.position.set(value, center.y, center.z);
+      plane.rotation.y = Math.PI / 2;
+    }
+
+    plane.name = 'cutPlaneHelper';
+    plane.userData.__cutPlaneHelper = true;
+    group.add(plane);
+  };
+
+  // Rebind the constructor so the app-created viewer is available as
+  // window.viewer and clipping is enabled as soon as the renderer exists.
+  try {
+    const BaseFDSViewer = FDSViewer;
+    FDSViewer = class FDSViewerWithCutPlane extends BaseFDSViewer {
+      constructor(container) {
+        super(container);
+        if (this.renderer) this.renderer.localClippingEnabled = true;
+        window.viewer = this;
+        if (container) container._fdsViewer = this;
+      }
+    };
++  } catch (err) {
+    console.warn('Could not expose cut-plane viewer instance:', err);
+  }
+
+  function injectCutPlanePanel() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar || document.getElementById('cut-plane-panel')) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'cut-plane-panel';
+    panel.className = 'panel-section';
+    panel.innerHTML = `
+      <h3>Cut Plane</h3>
+      <div style="display:grid; gap:0.45rem; font-size:0.9rem;">
+        <label>Axis
+          <select id="cut-plane-axis" style="width:100%;">
+            <option value="x">FDS X</option>
+            <option value="y">FDS Y</option>
+            <option value="z" selected>FDS Z</option>
+          </select>
+        </label>
+        <label>Position
+          <input id="cut-plane-value" type="number" step="0.1" value="1.5" style="width:100%;">
+        </label>
+        <label>Visible side
+          <select id="cut-plane-side" style="width:100%;">
+            <option value="negative" selected>Keep lower / negative side</option>
+            <option value="positive">Keep upper / positive side</option>
+          </select>
+        </label>
+        <div style="display:flex; gap:0.35rem; flex-wrap:wrap;">
+          <button id="cut-plane-apply" type="button">Apply</button>
+          <button id="cut-plane-flip" type="button">Flip</button>
+          <button id="cut-plane-clear" type="button">Clear</button>
+        </div>
+      </div>
+    `;
+
+    const selectedPanel = document.getElementById('info-content');
+    const selectedSection = selectedPanel ? selectedPanel.closest('.panel-section') : null;
+    if (selectedSection && selectedSection.parentNode === sidebar) {
+      sidebar.insertBefore(panel, selectedSection);
+    } else {
+      sidebar.appendChild(panel);
+    }
+
+    const getViewer = () => window.viewer || document.getElementById('viewer-container')?._fdsViewer;
+    const axisInput = document.getElementById('cut-plane-axis');
+    const valueInput = document.getElementById('cut-plane-value');
+    const sideInput = document.getElementById('cut-plane-side');
+
+    document.getElementById('cut-plane-apply').addEventListener('click', () => {
+      const viewer = getViewer();
+      if (!viewer) return;
 /**
  * FDS Visualization Tool - Main Application
  * Connects the parser and viewer, handles UI interactions
