@@ -204,7 +204,7 @@
         if (container) container._fdsViewer = this;
       }
     };
-+  } catch (err) {
+  } catch (err) {
     console.warn('Could not expose cut-plane viewer instance:', err);
   }
 
@@ -258,12 +258,28 @@
     document.getElementById('cut-plane-apply').addEventListener('click', () => {
       const viewer = getViewer();
       if (!viewer) return;
-/**
- * FDS Visualization Tool - Main Application
- * Connects the parser and viewer, handles UI interactions
- */
+      const axis = axisInput.value;
+      const value = Number(valueInput.value);
+      const keepSide = sideInput.value === 'positive' ? 'positive' : 'negative';
+      if (!Number.isFinite(value)) return;
+      viewer.setCutPlane(axis, value, keepSide, { showHelper: true });
+    });
 
-document.addEventListener('DOMContentLoaded', () => {
+    document.getElementById('cut-plane-flip').addEventListener('click', () => {
+      const viewer = getViewer();
+      if (!viewer) return;
+      viewer.flipCutPlane();
+    });
+
+    document.getElementById('cut-plane-clear').addEventListener('click', () => {
+      const viewer = getViewer();
+      if (!viewer) return;
+      viewer.clearCutPlane();
+    });
+  }
+
+  const initApp = () => {
+    injectCutPlanePanel();
     const container = document.getElementById('viewer-container');
     const viewer = new FDSViewer(container);
     const parser = new FDSParser();
@@ -657,7 +673,14 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'r': viewer.resetCamera(); break;
         }
     });
-});
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+  } else {
+    initApp();
+  }
+})();
 
 // Sample FDS lives in examples/sample_room_fire.fds and is fetched on
 // demand by the "Load Sample" button above.
